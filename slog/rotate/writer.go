@@ -102,11 +102,72 @@ func (d *Writer) init() error {
 		if d.cfg.RotateMode == ModeCreate {
 			// logfile = d.cfg.Filepath + "." + now.Format(d.suffixFormat)
 			logfile = d.buildFilePath(now.Format(d.suffixFormat))
+		} else if err := d.bootstrapMissedTimeRotate(); err != nil {
+			// ModeRename 下，补偿关机期间错过的跨周期轮转，避免新日志追加进旧文件
+			return err
 		}
 	}
 
 	// open the current file
 	return d.openFile(logfile)
+}
+
+// bootstrapMissedTimeRotate 在打开活跃文件之前，补偿进程停机期间错过的时间轮转。
+//
+// 背景：nextRotatingAt 总是按"启动时刻"重新计算为当前周期的结束边界，关机期间
+// 错过的边界不会被补算。例如按天轮转时 11-10 关机、11-11 重启，若不补偿，10 日的
+// error.log 不会被转存，11 日的新日志会继续追加进同一个文件。
+//
+// 规则：
+//   - 仅 ModeRename 生效（ModeCreate 的活跃文件名本身带周期后缀，不存在跨周期追加）；
+//   - 活跃文件最后修改时间落在当前周期之前：先重命名为它所属周期的备份文件，
+//     随后 openFile 会创建一个全新的活跃文件；
+//   - 文件不存在（首次启动）或仍属于当前周期：不做任何处理；
+//   - rename 失败（Windows 上文件被其它进程占用）不阻断启动，退化为追加写。
+func (d *Writer) bootstrapMissedTimeRotate() error {
+	info, err := os.Stat(d.cfg.Filepath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return nil
+	}
+
+	// 当前周期起点 = 当前周期结束边界 - 一个轮转间隔
+	periodStart := d.nextRotatingAt.Add(-time.Duration(d.checkInterval) * time.Second)
+	modTime := info.ModTime()
+	if !modTime.Before(periodStart) {
+		return nil // 文件属于当前周期，等待运行期正常轮转即可
+	}
+
+	// 用文件最后写入时间所在周期的结束边界生成备份名，
+	// 与运行期 rotatingByTime 用 nextRotatingAt 命名的规则保持一致。
+	suffix := d.cfg.RotateTime.FirstCheckTime(modTime).Format(d.suffixFormat)
+	bakFile := d.uniqueBackupPath(d.buildFilePath(suffix))
+	if renameErr := os.Rename(d.cfg.Filepath, bakFile); renameErr != nil {
+		printErrln("rotatefile: bootstrap rename failed (fallback to append):", renameErr)
+		return nil
+	}
+	d.debugLog("bootstrap rotate:", d.cfg.Filepath, "->", bakFile)
+	return nil
+}
+
+// uniqueBackupPath 在目标备份路径已存在时追加 _2、_3 ... 序号，避免覆盖历史备份。
+// 形如 som.log.20261110 -> som.log.20261110_2，后缀仍满足读取侧的
+// 转存文件命名规则（<数字>[_<序号>]）。
+func (d *Writer) uniqueBackupPath(target string) string {
+	if _, err := os.Stat(target); os.IsNotExist(err) {
+		return target
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s_%d", target, i)
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
 }
 
 // Config gets the config
@@ -303,6 +364,14 @@ func (d *Writer) rotatingFile(bakFile string, rename bool) error {
 	// rename current to a new file.
 	if rename || d.cfg.RotateMode == ModeRename {
 		if err := os.Rename(d.path, bakFile); err != nil {
+			// Windows 上文件可能仍被其它进程（日志采集 agent、杀软、重复实例）
+			// 占用而 rename 失败。此时 d.file 已在上面 close，若直接返回，后续写入
+			// 会全部作用在已关闭句柄上，且错误被上层 bufio 静默吞掉，表现为日志
+			// 彻底停写直到重启。这里重开原文件恢复句柄，退化为继续追加写，
+			// 并保留真实文件大小，等待下一次写入/Flush 再尝试轮转。
+			if reopenErr := d.openFile(d.path); reopenErr != nil {
+				return reopenErr
+			}
 			return err
 		}
 	}
@@ -540,6 +609,14 @@ func (d *Writer) openFile(logfile string) error {
 
 	d.path = logfile
 	d.file = file
+
+	// O_APPEND 打开一个已存在的文件时，用其真实大小初始化 written。
+	// 否则进程重启后 written 从 0 重新计数，尺寸轮转要再写满一个 MaxSize
+	// 才会触发，磁盘上的实际文件可能涨到近两倍阈值仍不转存。
+	// 注意：rotatingFile 成功新建文件后会显式把 written 重置为 0，不受影响。
+	if fi, statErr := file.Stat(); statErr == nil {
+		d.written = uint64(fi.Size())
+	}
 	return nil
 }
 
