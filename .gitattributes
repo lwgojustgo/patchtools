@@ -1,0 +1,5 @@
+# Go 源码与模块文件在索引中统一存 LF。显式声明 eol，避免依赖
+# core.autocrlf 的机器配置，防止 CRLF/LF 混用造成全文件 diff。
+*.go   text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf

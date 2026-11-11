@@ -5,9 +5,9 @@
 //
 // 同时，本包针对 caller 业务模块的 C 接口（PluginWrapCaller.h）提供跨 cgo
 // 翻译单元的桥接函数（BridgeInitializeCaller / BridgeSetLogger）：
-//	- 集中处理 patchtools/cgo 翻译单元与 caller 业务翻译单元之间的 *_Ctype_char 转换
-//	- 集中使用 unsafe.Pointer 中转（Go 语言层面无法避免，见 issue #13467）
-//	- caller 业务代码无需关心跨翻译单元类型转换，caller.go 中无 unsafe 类型转换。
+//   - 集中处理 patchtools/cgo 翻译单元与 caller 业务翻译单元之间的 *_Ctype_char 转换
+//   - 集中使用 unsafe.Pointer 中转（Go 语言层面无法避免，见 issue #13467）
+//   - caller 业务代码无需关心跨翻译单元类型转换，caller.go 中无 unsafe 类型转换。
 package cgo
 
 // #include <stdlib.h>

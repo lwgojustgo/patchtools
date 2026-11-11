@@ -1,19 +1,13 @@
 package xunsafe
 
-import (
-	"reflect"
-	"unsafe"
-)
+import "unsafe"
 
 func TestPanicFunc() {
 	a := "test panic"
-	sh := (*reflect.StringHeader)(unsafe.Pointer(&a))
-	bh := reflect.SliceHeader{
-		Data: sh.Data,
-		Len:  sh.Len,
-		Cap:  sh.Len,
-	}
-	b := *(*[]byte)(unsafe.Pointer(&bh))
+	// 直接由字符串数据构造切片，避免手工拼装 reflect.SliceHeader
+	// （vet 会报 possible misuse，且 uintptr 临时值不保证 GC 安全）。
+	// 写入只读字符串数据仍会 panic，与该函数原有意图一致。
+	b := unsafe.Slice(unsafe.StringData(a), len(a))
 	b[0] = 'H'
 }
 

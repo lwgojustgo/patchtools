@@ -23,6 +23,43 @@ import (
 	"github.com/gookit/goutil/x/stdio"
 )
 
+const (
+	// 轮转失败后的最大退避时长
+	maxRotateBackoff = time.Minute
+	// 备份名序号上限，避免文件系统异常时无限循环
+	maxBackupSeq = 10000
+)
+
+// rotateBackoff 返回第 failures 次连续失败后的退避时长，指数增长并封顶。
+func rotateBackoff(failures uint) time.Duration {
+	d := time.Second
+	for i := uint(1); i < failures && d < maxRotateBackoff; i++ {
+		d *= 2
+	}
+	if d > maxRotateBackoff {
+		return maxRotateBackoff
+	}
+	return d
+}
+
+// rotateAllowed 判断当前是否允许再次尝试轮转。轮转失败（多为 Windows 文件占用）
+// 后做退避，避免每条日志都执行 sync + rename + reopen 这套昂贵且大概率仍会失败的操作。
+func (d *Writer) rotateAllowed(now time.Time) bool {
+	return d.rotateRetryAt.IsZero() || !now.Before(d.rotateRetryAt)
+}
+
+// markRotateFailed 记录一次轮转失败。时间边界保持不变（见 rotatingByTime），
+// 退避结束后仍会重试，不会因一次失败跳过整个周期。
+func (d *Writer) markRotateFailed(now time.Time) {
+	d.rotateFailures++
+	d.rotateRetryAt = now.Add(rotateBackoff(d.rotateFailures))
+}
+
+func (d *Writer) clearRotateFailed() {
+	d.rotateFailures = 0
+	d.rotateRetryAt = time.Time{}
+}
+
 // Writer a flush, close, writer and support rotate file.
 //
 // refer https://github.com/flike/golog/blob/master/filehandler.go
@@ -51,6 +88,12 @@ type Writer struct {
 	// context use for rotating file by size
 	written   uint64 // written size
 	rotateNum uint   // rotate times number
+
+	// ---- context use for rotating failure backoff ----
+
+	// 轮转失败后的重试起点（零值表示无退避）与连续失败次数
+	rotateRetryAt  time.Time
+	rotateFailures uint
 
 	// ---- context use for rotating file by time ----
 
@@ -102,9 +145,11 @@ func (d *Writer) init() error {
 		if d.cfg.RotateMode == ModeCreate {
 			// logfile = d.cfg.Filepath + "." + now.Format(d.suffixFormat)
 			logfile = d.buildFilePath(now.Format(d.suffixFormat))
-		} else if err := d.bootstrapMissedTimeRotate(); err != nil {
+		} else if d.cfg.IsMode(ModeRename) {
 			// ModeRename 下，补偿关机期间错过的跨周期轮转，避免新日志追加进旧文件
-			return err
+			if err := d.bootstrapMissedTimeRotate(); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -120,11 +165,22 @@ func (d *Writer) init() error {
 //
 // 规则：
 //   - 仅 ModeRename 生效（ModeCreate 的活跃文件名本身带周期后缀，不存在跨周期追加）；
-//   - 活跃文件最后修改时间落在当前周期之前：先重命名为它所属周期的备份文件，
+//   - 活跃文件最后修改时间落在当前周期之前：先原子占位一个备份路径并把文件重命名过去，
 //     随后 openFile 会创建一个全新的活跃文件；
 //   - 文件不存在（首次启动）或仍属于当前周期：不做任何处理；
-//   - rename 失败（Windows 上文件被其它进程占用）不阻断启动，退化为追加写。
+//   - 秒/亚分钟级轮转（interval < 1min）不补偿：其 FirstCheckTime 返回 now+interval，
+//     当前周期起点恰好等于启动时刻，任何历史文件都会被误判为跨周期；
+//   - 占位或 rename 失败（Windows 上文件被其它进程占用）不阻断启动，退化为追加写；
+//   - 转存后保留原 mtime，不改为归档时刻，与读取侧「后缀 vs mtime」的容差规则对齐。
+//
+// 注意：周期归属完全依赖文件 mtime。系统时钟回拨、外部工具 touch 文件、
+// 或文件系统时间精度不足时可能误判/漏判。
 func (d *Writer) bootstrapMissedTimeRotate() error {
+	// levelSec 的周期起点恒等于启动时刻，补偿会退化成"每次重启都切割日志"。
+	if d.checkInterval < int64(EveryMinute) {
+		return nil
+	}
+
 	info, err := os.Stat(d.cfg.Filepath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -146,28 +202,59 @@ func (d *Writer) bootstrapMissedTimeRotate() error {
 	// 用文件最后写入时间所在周期的结束边界生成备份名，
 	// 与运行期 rotatingByTime 用 nextRotatingAt 命名的规则保持一致。
 	suffix := d.cfg.RotateTime.FirstCheckTime(modTime).Format(d.suffixFormat)
-	bakFile := d.uniqueBackupPath(d.buildFilePath(suffix))
+	bakFile, err := d.reserveBackupPath(d.buildFilePath(suffix))
+	if err != nil {
+		printErrln("rotatefile: bootstrap reserve backup failed (fallback to append):", err)
+		return nil
+	}
 	if renameErr := os.Rename(d.cfg.Filepath, bakFile); renameErr != nil {
+		// 清理占位文件；若删除也失败（权限/杀软拦截），磁盘上会留下一个后缀
+		// 合法、0 字节的伪备份，读取侧可能把它当成真实转存候选，需单独告警。
+		// IsNotExist 说明占位文件已被外部清走，没有残留风险，不必误报。
+		if rmErr := os.Remove(bakFile); rmErr != nil && !os.IsNotExist(rmErr) {
+			printErrln("rotatefile: bootstrap remove placeholder failed (empty backup may remain):", rmErr)
+		}
 		printErrln("rotatefile: bootstrap rename failed (fallback to append):", renameErr)
 		return nil
 	}
+
+	// 刻意保留原文件 mtime，不更新为归档时刻：读取侧以备份名后缀解析内容
+	// 结束时刻，并与 mtime 做 48h 容差校验；长时间停机后改 mtime 会让旧日志
+	// 被误判为新文件而错乱排序。短 BackupTime 下这类陈旧备份被清理，
+	// 属于保留策略的正常语义（内容确实老于保留窗口）。
 	d.debugLog("bootstrap rotate:", d.cfg.Filepath, "->", bakFile)
 	return nil
 }
 
-// uniqueBackupPath 在目标备份路径已存在时追加 _2、_3 ... 序号，避免覆盖历史备份。
-// 形如 som.log.20261110 -> som.log.20261110_2，后缀仍满足读取侧的
-// 转存文件命名规则（<数字>[_<序号>]）。
-func (d *Writer) uniqueBackupPath(target string) string {
-	if _, err := os.Stat(target); os.IsNotExist(err) {
-		return target
-	}
-	for i := 2; ; i++ {
-		candidate := fmt.Sprintf("%s_%d", target, i)
-		if _, err := os.Stat(candidate); os.IsNotExist(err) {
-			return candidate
+// reserveBackupPath 原子地占用一个未被使用的备份路径并返回它。
+//
+// 用 O_CREATE|O_EXCL 创建占位文件，而不是先 Stat 再 Rename：后者存在 TOCTOU，
+// 多个实例同时启动可能选中同一个备份名，Unix 上 rename 会直接覆盖前一个实例
+// 刚归档的日志。占位成功后由调用方用 os.Rename 覆盖该占位文件（各平台均支持
+// 替换普通文件），后缀 _2、_3 ... 仍满足转存文件命名规则 <数字>[_<序号>]。
+func (d *Writer) reserveBackupPath(target string) (string, error) {
+	for i := 1; i <= maxBackupSeq; i++ {
+		candidate := target
+		if i > 1 {
+			candidate = fmt.Sprintf("%s_%d", target, i)
+		}
+
+		f, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, d.cfg.FilePerm)
+		if err == nil {
+			if closeErr := f.Close(); closeErr != nil {
+				// 同样要避免留下 0 字节伪备份
+				if rmErr := os.Remove(candidate); rmErr != nil && !os.IsNotExist(rmErr) {
+					printErrln("rotatefile: reserve remove placeholder failed (empty backup may remain):", rmErr)
+				}
+				return "", closeErr
+			}
+			return candidate, nil
+		}
+		if !os.IsExist(err) {
+			return "", err // 权限/IO 错误不再猜序号，交由调用方降级
 		}
 	}
+	return "", fmt.Errorf("rotatefile: no free backup name for %q (tried %d suffixes)", target, maxBackupSeq)
 }
 
 // Config gets the config
@@ -175,20 +262,41 @@ func (d *Writer) Config() Config {
 	return *d.cfg
 }
 
+// fileHandle 返回可用的文件句柄。轮转失败且重开也失败时 d.file 为 nil，
+// 此处延迟重开，避免任何路径上出现 nil 解引用或向已关闭句柄写入。
+func (d *Writer) fileHandle() (*os.File, error) {
+	if d.file != nil {
+		return d.file, nil
+	}
+	if err := d.openFile(d.path); err != nil {
+		printErrln("rotatefile: reopen log file error:", err)
+		return nil, err
+	}
+	return d.file, nil
+}
+
 // Flush sync data to disk. alias of Sync()
 func (d *Writer) Flush() error {
+	f, err := d.fileHandle()
+	if err != nil {
+		return err
+	}
 	// 先同步数据到磁盘
-	if err := d.file.Sync(); err != nil {
+	if err := f.Sync(); err != nil {
 		return err
 	}
 
 	// 刷盘后检查是否需要轮转（因为实际文件大小可能已经超过限制）
-	return d.doRotate()
+	return d.doRotate(false)
 }
 
 // Sync data to disk.
 func (d *Writer) Sync() error {
-	return d.file.Sync()
+	f, err := d.fileHandle()
+	if err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // Close the writer. will sync data to disk, then close the file handle.
@@ -208,7 +316,11 @@ func (d *Writer) MustClose() {
 }
 
 func (d *Writer) close(closeStopCh bool) error {
-	if err := d.file.Sync(); err != nil {
+	f, err := d.fileHandle()
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		return err
 	}
 
@@ -218,7 +330,7 @@ func (d *Writer) close(closeStopCh bool) error {
 		close(d.stopCh)
 		d.stopCh = nil
 	}
-	return d.file.Close()
+	return f.Close()
 }
 
 //
@@ -236,11 +348,13 @@ func (d *Writer) WriteString(s string) (n int, err error) {
 func (d *Writer) Write(p []byte) (n int, err error) {
 	// do write data
 	if n, err = d.doWrite(p); err != nil {
+		// 上层 bufio/LineWriter 会锁死在任何写错误上，这里至少留下可观测的错误
+		printErrln("rotatefile: write error:", err)
 		return
 	}
 
 	// do rotate file
-	if rotErr := d.doRotate(); rotErr != nil {
+	if rotErr := d.doRotate(false); rotErr != nil {
 		// rotate failure must NOT be returned to caller:
 		// bufio/LineWriter permanently locks on any write error (b.err),
 		// which would stop all future log writes. Log the error and continue.
@@ -261,7 +375,11 @@ func (d *Writer) doWrite(p []byte) (n int, err error) {
 		defer d.mu.Unlock()
 	}
 
-	n, err = d.file.Write(p)
+	f, err := d.fileHandle()
+	if err != nil {
+		return 0, err
+	}
+	n, err = f.Write(p)
 	if err == nil {
 		// update size
 		d.written += uint64(n)
@@ -269,10 +387,10 @@ func (d *Writer) doWrite(p []byte) (n int, err error) {
 	return
 }
 
-
 // Rotate the file by config and async clean backups
 func (d *Writer) Rotate() error {
-	err := d.doRotate()
+	// 手动轮转不受自动重试退避影响
+	err := d.doRotate(true)
 
 	// async clean backup files.
 	if err == nil && d.shouldClean(true) {
@@ -281,12 +399,18 @@ func (d *Writer) Rotate() error {
 	return err
 }
 
-// do rotate the logfile by config
-func (d *Writer) doRotate() (err error) {
+// do rotate the logfile by config.
+// force 为 true 时跳过失败退避（手动 Rotate）。
+func (d *Writer) doRotate(force bool) (err error) {
 	// if enable lock
 	if !d.cfg.CloseLock {
 		d.mu.Lock()
 		defer d.mu.Unlock()
+	}
+
+	now := d.cfg.TimeClock.Now()
+	if !force && !d.rotateAllowed(now) {
+		return nil
 	}
 
 	// do rotate a file by size
@@ -295,6 +419,7 @@ func (d *Writer) doRotate() (err error) {
 	if d.cfg.MaxSize > 0 && d.written > d.cfg.MaxSize {
 		err = d.rotatingBySize()
 		if err != nil {
+			d.markRotateFailed(now)
 			return
 		}
 	}
@@ -302,7 +427,13 @@ func (d *Writer) doRotate() (err error) {
 	// do rotate a file by time
 	if d.checkInterval > 0 && d.written > 0 {
 		err = d.rotatingByTime()
+		if err != nil {
+			d.markRotateFailed(now)
+			return
+		}
 	}
+
+	d.clearRotateFailed()
 	return
 }
 
@@ -315,13 +446,19 @@ func (d *Writer) rotatingByTime() error {
 
 	// generate new file path.
 	// eg: /tmp/error.log => /tmp/error.20220423_1600.log
-	// file := d.cfg.Filepath + "." + d.nextRotatingAt.Format(d.suffixFormat)
 	file := d.buildFilePath(d.nextRotatingAt.Format(d.suffixFormat))
-	err := d.rotatingFile(file, false)
+	if err := d.rotatingFile(file, false); err != nil {
+		// 失败时保持 nextRotatingAt 不变，退避结束后仍会重试。无条件推进会让
+		// 一次 rename 失败跳过整个周期（按天轮转即整天不再归档）。
+		return err
+	}
 
-	// calc and storage next rotating time
-	d.nextRotatingAt = d.nextRotatingAt.Add(time.Duration(d.checkInterval) * time.Second)
-	return err
+	// 成功才推进边界。若故障期间已跨过多个周期，直接跳到当前时间之后的第一个
+	// 边界，避免恢复后连续补转出多个几乎为空的备份文件。
+	interval := time.Duration(d.checkInterval) * time.Second
+	periods := int64(now.Sub(d.nextRotatingAt)/interval) + 1
+	d.nextRotatingAt = d.nextRotatingAt.Add(time.Duration(periods) * interval)
+	return nil
 }
 
 func (d *Writer) rotatingBySize() error {
@@ -355,6 +492,13 @@ func (d *Writer) rotatingBySize() error {
 func (d *Writer) rotatingFile(bakFile string, rename bool) error {
 	// close the current file
 	if err := d.close(false); err != nil {
+		// close(false) 可能在 Sync 失败时提前返回，此时句柄仍未关闭；补一次
+		// Close 释放 fd（已关闭时只返回 ErrClosed，忽略即可），再标记失效，
+		// 交由 fileHandle 自愈重开。这里不是重复关闭，而是覆盖 Sync 失败路径。
+		if d.file != nil {
+			_ = d.file.Close()
+		}
+		d.file = nil
 		return err
 	}
 
@@ -367,10 +511,11 @@ func (d *Writer) rotatingFile(bakFile string, rename bool) error {
 			// Windows 上文件可能仍被其它进程（日志采集 agent、杀软、重复实例）
 			// 占用而 rename 失败。此时 d.file 已在上面 close，若直接返回，后续写入
 			// 会全部作用在已关闭句柄上，且错误被上层 bufio 静默吞掉，表现为日志
-			// 彻底停写直到重启。这里重开原文件恢复句柄，退化为继续追加写，
-			// 并保留真实文件大小，等待下一次写入/Flush 再尝试轮转。
+			// 彻底停写直到重启。这里重开原文件恢复句柄，退化为继续追加写；
+			// 何时重试轮转由 doRotate 的退避机制决定。
 			if reopenErr := d.openFile(d.path); reopenErr != nil {
-				return reopenErr
+				d.file = nil // 避免向已关闭句柄写入；fileHandle 会继续尝试自愈
+				return fmt.Errorf("rotatefile: rename failed: %w; reopen also failed: %v", err, reopenErr)
 			}
 			return err
 		}
@@ -384,6 +529,7 @@ func (d *Writer) rotatingFile(bakFile string, rename bool) error {
 
 	// reopen log file
 	if err := d.openFile(logfile); err != nil {
+		d.file = nil
 		return err
 	}
 
